@@ -26,6 +26,7 @@ git clone https://github.com/junnnnnw00/postech-plms-mcp.git
 cd postech-plms-mcp
 python3 -m venv .venv
 . .venv/bin/activate
+python -m pip install --upgrade 'pip>=26.2.1' 'setuptools>=83.0.0'
 python -m pip install -e .
 plms-mcp login --method sso
 plms-mcp doctor
