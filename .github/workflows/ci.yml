@@ -1,0 +1,50 @@
+name: tests-and-build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade 'pip>=26.2.1'
+          python -m pip install -e '.[dev]'
+      - name: Check code
+        run: ruff check src tests
+      - name: Test without school credentials
+        run: pytest -q
+      - name: Build distribution
+        run: python -m build
+      - name: Audit installed dependencies
+        run: pip-audit --progress-spinner off
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.12'
+        with:
+          name: python-distribution
+          path: dist/*
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime container
+        run: docker build --tag postech-plms-mcp:test .
+      - name: Verify CLI
+        run: docker run --rm postech-plms-mcp:test --help

@@ -1,0 +1,31 @@
+services:
+  plms:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      PLMS_DATA_DIR: /data
+      PLMS_ISSUER_URL: ${PLMS_ISSUER_URL:?Set an HTTPS origin in .env}
+      PLMS_CONNECT_PASSWORD: ${PLMS_CONNECT_PASSWORD:?Set a separate random connection secret in .env}
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - plms-state:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/.well-known/oauth-authorization-server', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  plms-state:
