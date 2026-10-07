@@ -14,6 +14,7 @@ from starlette.routing import Route
 
 from .client import PLMSClient
 from .errors import PLMSError
+from .oauth_store import StateStoreError
 from .service import PLMSService
 from .storage import Vault
 
@@ -49,6 +50,14 @@ def protected(fn):
                 "error": {
                     "code": "invalid_input",
                     "message": "The supplied input is invalid or the source format is unsupported.",
+                },
+                "partial": True,
+            }
+        except StateStoreError:
+            return {
+                "error": {
+                    "code": "authentication_state_unavailable",
+                    "message": "Persistent authentication state is unavailable. Check the database and login status.",
                 },
                 "partial": True,
             }
@@ -247,6 +256,8 @@ def create_http_app(vault: Vault, issuer: str, connect_password: str):
         finally:
             await mcp.plms_service.client.close()
             provider.close()
+            if hasattr(vault, "close"):
+                vault.close()
 
     app.router.lifespan_context = application_lifespan
     app.router.routes[0:0] = oauth_routes

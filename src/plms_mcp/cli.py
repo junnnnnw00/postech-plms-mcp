@@ -138,7 +138,14 @@ async def _doctor(vault: Vault) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        vault = Vault(args.data_dir.expanduser() if args.data_dir else None)
+        if os.environ.get("PLMS_ENV_LOGIN") == "1" and args.command == "serve":
+            if args.transport != "http" or args.data_dir:
+                raise ValueError("Cloud environment login requires HTTP without a local data directory")
+            from .cloud_vault import CloudVault
+
+            vault = CloudVault.from_environment()
+        else:
+            vault = Vault(args.data_dir.expanduser() if args.data_dir else None)
         if args.command == "login":
             username = args.username or os.environ.get("PLMS_USERNAME") or input("POSTECH account ID: ")
             password = os.environ.get("PLMS_PASSWORD") or getpass.getpass("POSTECH password: ")

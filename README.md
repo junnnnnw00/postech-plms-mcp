@@ -90,3 +90,6 @@ pip-audit
 ## 라이선스
 
 MIT. 학교 강의자료와 타인의 저작권은 이 코드 라이선스에 포함되지 않습니다.
+
+
+- [무료 호스팅 후보 구성: Render Free + Neon (실제 배포 미검증)](docs/free-hosting.md)

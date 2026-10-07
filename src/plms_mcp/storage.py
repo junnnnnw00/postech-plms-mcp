@@ -58,6 +58,15 @@ class Vault:
         self._check(name)
         (self.directory / (name + ".enc")).unlink(missing_ok=True)
 
+    def begin_login(self, credentials: dict) -> bool:
+        credentials["disabled"] = True
+        self.write("credentials", credentials)
+        return True
+
+    def complete_login(self, credentials: dict) -> None:
+        credentials["disabled"] = False
+        self.write("credentials", credentials)
+
     @staticmethod
     def _check(name: str) -> None:
         if name not in {"credentials", "cookies", "snapshots"}:

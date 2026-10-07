@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from .auth import BASE, export_cookies, import_cookies, login_direct, login_sso
+from .auth import BASE, auth_request, export_cookies, import_cookies, logged_in, login_direct, login_sso
 from .errors import AuthenticationRequired, UnsafeURL, UpstreamError
 from .storage import Vault
 
@@ -135,6 +135,7 @@ class PLMSClient:
         import_cookies(self.http, self._saved_cookies)
         self._request_lock = asyncio.Lock()
         self._login_lock = asyncio.Lock()
+        self._login_generation = 0
         self._last_request = 0.0
         self._cache: dict[str, tuple[float, str, str]] = {}
         self.source_fetched_at: dict[str, str] = {}
@@ -221,25 +222,33 @@ class PLMSClient:
                     ) from None
         raise UpstreamError("Too many PLMS redirects.")
 
-    async def refresh_session(self) -> bool:
+    async def refresh_session(self, *, expected_cookies=None, expected_generation=None) -> bool:
         async with self._login_lock:
             # Re-read cookies so CLI re-login takes effect without restarting the server.
             self._sync_saved_cookies()
+            if (
+                expected_generation is not None and self._login_generation != expected_generation
+            ) or (expected_cookies is not None and self._saved_cookies != expected_cookies):
+                # Another queued request already refreshed this session.
+                return True
             credentials = self.vault.read("credentials")
             if not credentials or credentials.get("disabled"):
                 return False
-            credentials["disabled"] = True  # persist before attempt; a failed attempt is never auto-repeated
-            self.vault.write("credentials", credentials)
+            if not self.vault.begin_login(credentials):
+                return False
             login = login_sso if credentials.get("method", "sso") == "sso" else login_direct
             try:
                 await login(self.http, credentials["username"], credentials["password"])
+                response = await auth_request(self.http, "GET", BASE + "/")
+                if not logged_in(response.text) or not export_cookies(self.http):
+                    raise AuthenticationRequired("Re-login did not establish a verified PLMS session")
             except Exception:
                 raise AuthenticationRequired(
                     "Automatic PLMS re-login failed and is disabled. Run plms-mcp login again."
                 ) from None
             self._save_cookies()
-            credentials["disabled"] = False
-            self.vault.write("credentials", credentials)
+            self.vault.complete_login(credentials)
+            self._login_generation += 1
             self._cache.clear()
             return True
 
@@ -259,10 +268,14 @@ class PLMSClient:
                 raise AuthenticationRequired("PLMS session expired; run plms-mcp login.")
             return text, final
 
+        expected_cookies = self._saved_cookies
+        expected_generation = self._login_generation
         try:
             result = await fetch()
         except AuthenticationRequired:
-            if not await self.refresh_session():
+            if not await self.refresh_session(
+                expected_cookies=expected_cookies, expected_generation=expected_generation
+            ):
                 raise
             result = await fetch()
         if len(self._cache) >= 256:

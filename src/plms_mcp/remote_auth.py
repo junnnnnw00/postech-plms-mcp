@@ -1,10 +1,10 @@
 """Single-owner OAuth for a personal PLMS MCP deployment.
 
 Each student runs a separate instance. PLMS credentials never enter this OAuth
-flow: the owner supplies a separate, strong PLMS_CONNECT_PASSWORD. SQLite stores
-encrypted OAuth state, indexed by hashes of opaque credentials. Keep its file
-across deployments; changing the connect password requires deleting that file
-and reconnecting clients. Run one ASGI worker (rate limits are process-local).
+flow: the owner supplies a separate, strong PLMS_CONNECT_PASSWORD. SQLite or
+PostgreSQL stores encrypted OAuth state, indexed by opaque credential hashes.
+Keep the database and connection password stable across deployments; changing
+the connection password requires an explicit state reset and client reconnect. Run one ASGI worker (rate limits are process-local).
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
@@ -45,6 +44,8 @@ from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
+
+from .oauth_store import OAuthStore
 
 SCOPE = "plms:read"
 CODE_TTL = 300
@@ -87,7 +88,10 @@ def _loopback(host: str | None) -> bool:
 class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
     """Persistent, revocable OAuth grants for one instance owner."""
 
-    def __init__(self, issuer_url: str, connect_password: str, *, db_path: str | Path | None = None):
+    def __init__(
+        self, issuer_url: str, connect_password: str, *,
+        db_path: str | Path | None = None, database_url: str | None = None,
+    ):
         issuer = str(AnyHttpUrl(issuer_url)).rstrip("/")
         parts = urlsplit(issuer)
         if parts.query or parts.fragment or parts.username or parts.password or parts.path:
@@ -118,60 +122,34 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             client_registration_options=self.registration_options,
             revocation_options=self.revocation_options,
         )
-        location = db_path or os.environ.get("PLMS_OAUTH_DB") or "data/oauth.sqlite3"
-        if str(location) != ":memory:":
-            # Preserve the final path component so O_NOFOLLOW can actually reject
-            # an existing database symlink instead of opening its resolved target.
-            path = Path(location).expanduser().absolute()
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # Create atomically with private mode; never silently follow symlinks.
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            os.close(fd)
-            os.chmod(path, 0o600)
-            location = str(path)
-        self._db = sqlite3.connect(str(location), isolation_level=None, check_same_thread=False)
-        self._lock = threading.RLock()
-        self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS config (name TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS state (
-                kind TEXT NOT NULL, key TEXT NOT NULL, client_id TEXT,
-                family TEXT, expires REAL NOT NULL, payload BLOB NOT NULL,
-                PRIMARY KEY(kind, key)
-            );
-            CREATE INDEX IF NOT EXISTS state_family ON state(family);
-            CREATE INDEX IF NOT EXISTS state_expiry ON state(expires);
-        """)
-        row = self._db.execute("SELECT value FROM config WHERE name='salt'").fetchone()
-        self._salt = base64.b64decode(row[0]) if row else secrets.token_bytes(16)
-        derived = self._derive(connect_password)
-        self._password_hash = derived[:32]
-        self._cipher = Fernet(base64.urlsafe_b64encode(derived[32:]))
-        if row:
-            check = self._db.execute("SELECT value FROM config WHERE name='check'").fetchone()
-            try:
-                valid = check and self._cipher.decrypt(check[0].encode()) == b"PLMS OAuth storage v1"
-            except InvalidToken:
-                valid = False
-            if not valid:
-                self._db.close()
-                raise ValueError(
-                    "OAuth database password mismatch; restore the connect password or reset OAuth state"
-                )
-        else:
-            with self._lock:
-                self._db.execute("BEGIN IMMEDIATE")
-                try:
-                    self._db.execute(
-                        "INSERT INTO config VALUES ('salt', ?)", (base64.b64encode(self._salt).decode(),)
-                    )
-                    self._db.execute(
-                        "INSERT INTO config VALUES ('check', ?)",
-                        (self._cipher.encrypt(b"PLMS OAuth storage v1").decode(),),
-                    )
-                    self._db.execute("COMMIT")
-                except BaseException:
-                    self._db.execute("ROLLBACK")
-                    raise
+        self._store = OAuthStore(db_path=db_path, database_url=database_url or os.environ.get("DATABASE_URL"))
+        self._lock = self._store.lock
+        # Retained only for existing SQLite test/debug compatibility.
+        self._db = self._store._connection
+        try:
+            # Read and initialize salt/check under the same cross-process lock.
+            with self._store.transaction():
+                salt = self._store.config("salt")
+                self._salt = base64.b64decode(salt) if salt else secrets.token_bytes(16)
+                derived = self._derive(connect_password)
+                self._password_hash = derived[:32]
+                self._cipher = Fernet(base64.urlsafe_b64encode(derived[32:]))
+                if salt:
+                    check = self._store.config("check")
+                    try:
+                        valid = check and self._cipher.decrypt(check.encode()) == b"PLMS OAuth storage v1"
+                    except InvalidToken:
+                        valid = False
+                    if not valid:
+                        raise ValueError(
+                            "OAuth database password mismatch; restore the connect password or reset OAuth state"
+                        )
+                else:
+                    self._store.set_config("salt", base64.b64encode(self._salt).decode())
+                    self._store.set_config("check", self._cipher.encrypt(b"PLMS OAuth storage v1").decode())
+        except BaseException:
+            self._store.close()
+            raise
         self._attempts: dict[str, deque[float]] = defaultdict(deque)
         # The rate limit bounds attempts over time, but concurrent scrypt calls
         # otherwise each allocate ~16 MiB and can exhaust small personal servers.
@@ -180,7 +158,7 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         self._password_slots = threading.BoundedSemaphore(2)
 
     def close(self) -> None:
-        self._db.close()
+        self._store.close()
 
     def _derive(self, password: str) -> bytes:
         return hashlib.scrypt(password.encode(), salt=self._salt, n=2**14, r=8, p=1, dklen=64)
@@ -221,27 +199,22 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         family: str | None = None,
     ) -> None:
         encrypted = self._cipher.encrypt(json.dumps(data, separators=(",", ":")).encode())
-        self._db.execute(
-            "INSERT OR REPLACE INTO state VALUES (?, ?, ?, ?, ?, ?)",
-            (kind, _digest(raw_key), client_id, family, expires, encrypted),
-        )
+        self._store.put(kind, _digest(raw_key), client_id, family, expires, encrypted)
 
     def _get(self, kind: str, raw_key: str) -> dict[str, Any] | None:
-        row = self._db.execute(
-            "SELECT expires, payload FROM state WHERE kind=? AND key=?", (kind, _digest(raw_key))
-        ).fetchone()
+        row = self._store.state(kind, _digest(raw_key))
         if not row or row[0] <= time.time():
             return None
         try:
-            return json.loads(self._cipher.decrypt(row[1]))
+            return json.loads(self._cipher.decrypt(bytes(row[1])))
         except (InvalidToken, ValueError):
             return None
 
     def _delete(self, kind: str, raw_key: str) -> None:
-        self._db.execute("DELETE FROM state WHERE kind=? AND key=?", (kind, _digest(raw_key)))
+        self._store.delete(kind, _digest(raw_key))
 
     def _prune(self) -> None:
-        self._db.execute("DELETE FROM state WHERE expires<=?", (time.time(),))
+        self._store.prune(time.time())
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         data = self._get("client", client_id)
@@ -275,9 +248,9 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
                 )
         if set((client_info.scope or SCOPE).split()) != {SCOPE}:
             raise RegistrationError("invalid_client_metadata", "Only plms:read is supported")
-        with self._lock:
+        with self._store.transaction():
             self._prune()
-            if self._db.execute("SELECT count(*) FROM state WHERE kind='client'").fetchone()[0] >= 1000:
+            if self._store.count("client") >= 1000:
                 raise RegistrationError("invalid_client_metadata", "Client registration capacity reached")
             self._put(
                 "client",
@@ -293,9 +266,9 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         if set(params.scopes or [SCOPE]) != {SCOPE}:
             raise AuthorizeError("invalid_scope", "Only plms:read is supported")
         ticket = _random()
-        with self._lock:
+        with self._store.transaction():
             self._prune()
-            if self._db.execute("SELECT count(*) FROM state WHERE kind='pending'").fetchone()[0] >= 200:
+            if self._store.count("pending") >= 200:
                 raise AuthorizeError("temporarily_unavailable", "Too many pending connections")
             self._put(
                 "pending",
@@ -349,51 +322,46 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                data = self._get("code", authorization_code.code)
-                if not data or data["client_id"] != client.client_id:
-                    raise TokenError("invalid_grant", "Authorization code is invalid or already used")
-                self._delete("code", authorization_code.code)
-                result = self._mint(data["client_id"], data["scopes"])
-                self._db.execute("COMMIT")
-                return result
-            except BaseException:
-                self._db.execute("ROLLBACK")
-                raise
+        with self._store.transaction():
+            data = self._get("code", authorization_code.code)
+            if not data or data["client_id"] != client.client_id:
+                raise TokenError("invalid_grant", "Authorization code is invalid or already used")
+            self._delete("code", authorization_code.code)
+            result = self._mint(data["client_id"], data["scopes"])
+            return result
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        data = self._get("refresh", refresh_token)
-        if not data or data["client_id"] != client.client_id:
-            # Reuse of a rotated credential indicates theft: invalidate its entire
-            # family, but never let a different client revoke another client's grant.
-            spent = self._get("spent_refresh", refresh_token)
-            if spent and spent["client_id"] == client.client_id:
-                self._db.execute("DELETE FROM state WHERE family=?", (spent["family"],))
-            return None
-        return RefreshToken(token=refresh_token, **data)
+        with self._store.transaction():
+            data = self._get("refresh", refresh_token)
+            if not data or data["client_id"] != client.client_id:
+                # Reuse of a rotated credential indicates theft: invalidate its entire
+                # family, but never let a different client revoke another client's grant.
+                spent = self._get("spent_refresh", refresh_token)
+                if spent and spent["client_id"] == client.client_id:
+                    self._store.revoke(spent["family"])
+                return None
+            return RefreshToken(token=refresh_token, **data)
 
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                data = self._get("refresh", refresh_token.token)
-                if not data or data["client_id"] != client.client_id:
-                    raise TokenError("invalid_grant", "Refresh token is invalid or already used")
+        result = None
+        with self._store.transaction():
+            data = self._get("refresh", refresh_token.token)
+            if not data or data["client_id"] != client.client_id:
+                # A token may have been loaded before another worker rotated it.
+                # Commit replay-family revocation before returning invalid_grant.
+                spent = self._get("spent_refresh", refresh_token.token)
+                if spent and spent["client_id"] == client.client_id:
+                    self._store.revoke(spent["family"])
+            else:
                 if not set(scopes).issubset(data["scopes"]):
                     raise TokenError("invalid_scope", "Cannot widen scopes")
-                row = self._db.execute(
-                    "SELECT family FROM state WHERE kind='refresh' AND key=?", (_digest(refresh_token.token),)
-                ).fetchone()
-                family = row[0]
-                self._db.execute(
-                    "DELETE FROM state WHERE family=? AND kind IN ('access','refresh')", (family,)
-                )
+                row = self._store.state("refresh", _digest(refresh_token.token))
+                family = row[2]
+                self._store.revoke(family, active_only=True)
                 self._put(
                     "spent_refresh",
                     refresh_token.token,
@@ -403,11 +371,9 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
                     family,
                 )
                 result = self._mint(data["client_id"], scopes, family=family)
-                self._db.execute("COMMIT")
-                return result
-            except BaseException:
-                self._db.execute("ROLLBACK")
-                raise
+        if result is None:
+            raise TokenError("invalid_grant", "Refresh token is invalid or already used")
+        return result
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         data = self._get("access", token)
@@ -420,13 +386,10 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
         return await self.load_access_token(token)
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        with self._lock:
-            row = self._db.execute(
-                "SELECT family FROM state WHERE key=? AND kind IN ('access','refresh')",
-                (_digest(token.token),),
-            ).fetchone()
-            if row:
-                self._db.execute("DELETE FROM state WHERE family=?", (row[0],))
+        with self._store.transaction():
+            family = self._store.family(_digest(token.token))
+            if family:
+                self._store.revoke(family)
 
     def _html(
         self,
@@ -496,12 +459,15 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             if not cookie or len(cookie) != 43:
                 cookie = _random()
             csrf = _random()
-            pending.update(session_hash=_digest(cookie), csrf_hash=_digest(csrf))
-            # Do not extend the original five-minute authorization lifetime.
-            row = self._db.execute(
-                "SELECT expires FROM state WHERE kind='pending' AND key=?", (_digest(ticket),)
-            ).fetchone()
-            self._put("pending", ticket, pending, row[0], client.client_id)
+            with self._store.transaction():
+                current = self._get("pending", ticket)
+                if not current:
+                    return Response("Connection request already used", status_code=400)
+                pending = current
+                pending.update(session_hash=_digest(cookie), csrf_hash=_digest(csrf))
+                # Do not extend the original five-minute authorization lifetime.
+                row = self._store.state("pending", _digest(ticket))
+                self._put("pending", ticket, pending, row[0], client.client_id)
             response = self._html(ticket, csrf, client, callback=pending["params"]["redirect_uri"])
             response.set_cookie(
                 self.cookie_name,
@@ -527,7 +493,8 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
                 headers={"Cache-Control": "no-store"},
             )
         if form.get("decision") == "deny":
-            self._delete("pending", ticket)
+            with self._store.transaction():
+                self._delete("pending", ticket)
             return self._redirect(pending["params"], error="access_denied")
         peer = request.client.host if request.client else "unknown"
         if self._limited("login:" + peer, 10, 300) or self._limited("login-global", 30, 300):
@@ -558,20 +525,13 @@ class PersonalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             resource=self.resource_url,
             subject="instance-owner",
         ).model_dump(mode="json", exclude={"code"})
-        with self._lock:
+        with self._store.transaction():
             # The password KDF yields to other requests; recheck one-time state.
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                current = self._get("pending", ticket)
-                if not current or current.get("csrf_hash") != pending.get("csrf_hash"):
-                    self._db.execute("ROLLBACK")
-                    return Response("Connection request already used", status_code=400)
-                self._delete("pending", ticket)
-                self._put("code", code, data, data["expires_at"], client.client_id)
-                self._db.execute("COMMIT")
-            except BaseException:
-                self._db.execute("ROLLBACK")
-                raise
+            current = self._get("pending", ticket)
+            if not current or current.get("csrf_hash") != pending.get("csrf_hash"):
+                return Response("Connection request already used", status_code=400)
+            self._delete("pending", ticket)
+            self._put("code", code, data, data["expires_at"], client.client_id)
         return self._redirect(pending["params"], code=code)
 
 
@@ -661,7 +621,8 @@ class _OAuthRouteGuard:
 
 
 def create_auth(
-    issuer_url: str, connect_password: str, *, db_path: str | Path | None = None
+    issuer_url: str, connect_password: str, *, db_path: str | Path | None = None,
+    database_url: str | None = None,
 ) -> tuple[PersonalOAuthProvider, list[Route]]:
     """Return provider plus complete guarded OAuth + consent routes.
 
@@ -670,7 +631,7 @@ def create_auth(
     That retains MCP protected-resource metadata and its bearer-token middleware
     while using these guarded authorization-server endpoints exactly once.
     """
-    provider = PersonalOAuthProvider(issuer_url, connect_password, db_path=db_path)
+    provider = PersonalOAuthProvider(issuer_url, connect_password, db_path=db_path, database_url=database_url)
     routes = create_auth_routes(
         provider,
         AnyHttpUrl(provider.issuer_url),

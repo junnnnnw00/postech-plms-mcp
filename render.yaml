@@ -1,0 +1,24 @@
+# Source template only. Provisioning and secret entry require owner approval.
+# No disk, paid cron job, managed Render database, or automatic paid upgrade.
+services:
+  - type: web
+    name: postech-plms-mcp-free
+    runtime: python
+    plan: free
+    autoDeployTrigger: "off"
+    buildCommand: pip install '.[postgres]'
+    startCommand: python scripts/render_start.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PLMS_ENV_LOGIN
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: PLMS_CONNECT_PASSWORD
+        sync: false
+      - key: PLMS_USERNAME
+        sync: false
+      - key: PLMS_PASSWORD
+        sync: false
+      - key: PLMS_CREDENTIAL_GENERATION
+        sync: false
